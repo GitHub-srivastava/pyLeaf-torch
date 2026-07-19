@@ -127,6 +127,19 @@ relative differences, solver diagnostics, and limitation regimes.
 python examples/compare_models.py --mode hard
 ```
 
+To generate overlaid A-Ci and A-Q response curves from identical parameters and
+environmental inputs, run:
+
+```bash
+python examples/plot_response_curves.py
+```
+
+The last row of `legacy/Input.xlsx` supplies the fixed conditions. The script
+performs controlled ambient-CO2 and irradiance sweeps, saves a PNG figure, and
+writes both curves (including solver status) as CSV files under
+`curve_comparison_output/`. Run it with `--help` to see sweep, input-row,
+parameter-JSON, and output options.
+
 Outputs go to `comparison_output/`. The new solver intentionally corrects stale
 state dependencies and convergence checks, so agreement should be judged along
 with the new equation residual—not by forcing exact equality with a legacy state
@@ -188,6 +201,7 @@ invalid-root/parameter handling, solver options, and the pandas adapter.
 legacy/                       frozen current NumPy/GEKKO implementation
 src/pyleaf_torch/             differentiable Torch package
 examples/compare_models.py    output comparison harness
+examples/plot_response_curves.py  overlaid A-Ci and A-Q curves
 examples/calibration_benchmark.py
 tests/                        solver, gradient, adapter, and provenance tests
 MODEL_NOTES.md                numerical/scientific design notes
