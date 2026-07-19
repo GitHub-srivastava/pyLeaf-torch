@@ -128,17 +128,36 @@ python examples/compare_models.py --mode hard
 ```
 
 To generate overlaid A-Ci and A-Q response curves from identical parameters and
-environmental inputs, run:
+environmental inputs, create an isolated environment and install the comparison
+dependency set once:
 
 ```bash
-python examples/plot_response_curves.py
+git clone <repository-url>
+cd pyLeaf-torch
+python -m venv .venv
+```
+
+On Windows PowerShell:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-comparison.txt
+.\.venv\Scripts\python.exe examples\plot_response_curves.py
+```
+
+On macOS or Linux:
+
+```bash
+.venv/bin/python -m pip install -r requirements-comparison.txt
+.venv/bin/python examples/plot_response_curves.py
 ```
 
 The last row of `legacy/Input.xlsx` supplies the fixed conditions. The script
 performs controlled ambient-CO2 and irradiance sweeps, saves a PNG figure, and
 writes both curves (including solver status) as CSV files under
 `curve_comparison_output/`. Run it with `--help` to see sweep, input-row,
-parameter-JSON, and output options.
+parameter-JSON, and output options. If it is launched with an interpreter that
+does not have the required packages, it reports every missing dependency and
+the exact installation command instead of failing on an import traceback.
 
 Outputs go to `comparison_output/`. The new solver intentionally corrects stale
 state dependencies and convergence checks, so agreement should be judged along

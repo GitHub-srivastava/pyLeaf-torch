@@ -8,9 +8,33 @@ ambient CO2 for A-Ci, and irradiance for A-Q.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 from pathlib import Path
+import sys
 from typing import Any
+
+# Allow this example to run directly from a source checkout without requiring
+# an editable installation of pyleaf-torch first.
+REPOSITORY = Path(__file__).resolve().parents[1]
+SOURCE = REPOSITORY / "src"
+if str(SOURCE) not in sys.path:
+    sys.path.insert(0, str(SOURCE))
+
+REQUIRED_PACKAGES = ("numpy", "pandas", "torch", "gekko", "matplotlib", "openpyxl")
+missing_packages = [
+    package
+    for package in REQUIRED_PACKAGES
+    if importlib.util.find_spec(package) is None
+]
+if missing_packages:
+    requirements = REPOSITORY / "requirements-comparison.txt"
+    raise SystemExit(
+        "Missing comparison dependencies: "
+        + ", ".join(missing_packages)
+        + "\nInstall them with the same Python interpreter:\n  "
+        + f'{sys.executable} -m pip install -r "{requirements}"'
+    )
 
 import numpy as np
 import pandas as pd
@@ -20,7 +44,6 @@ from compare_models import load_legacy
 from pyleaf_torch import DifferentiableLeaf, simulate_dataframe
 
 
-REPOSITORY = Path(__file__).resolve().parents[1]
 PAR_TO_Q = 4.57  # micromol photons per joule, also used inside pyLeaf
 
 
