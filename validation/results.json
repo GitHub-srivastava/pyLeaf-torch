@@ -1,0 +1,44 @@
+{
+  "date": "2026-07-19",
+  "environment": {
+    "python": "3.12.4",
+    "torch": "2.13.0+cpu",
+    "numpy": "2.5.1",
+    "pandas": "3.0.3",
+    "gekko": "1.3.2"
+  },
+  "legacy_comparison": {
+    "mode": "hard",
+    "rows": 55,
+    "legacy_sha256": "d14cd68d3ae90dcfd2d993ef379b4ef7a06f21b55941ad801fa3e95e55797efd",
+    "legacy_rows_below_full_residual_tolerance": 0,
+    "legacy_median_scaled_residual": 0.009294704383686622,
+    "legacy_maximum_scaled_residual": 0.16622826174489846,
+    "torch_converged_rows": 55,
+    "torch_maximum_scaled_residual": 6.089503390427353e-08,
+    "torch_maximum_iterations": 7,
+    "output_metrics": {
+      "aNet": {"mae": 0.020054495585536777, "max_abs": 0.07364104781696579},
+      "tLeaf": {"mae": 0.006244023955290407, "max_abs": 0.05664949307845646},
+      "gs": {"mae": 0.0010694325197670676, "max_abs": 0.01662282622253293},
+      "transpiration": {"mae": 9.922691641236229, "max_abs": 89.87892761707764}
+    }
+  },
+  "forward_stress_grid": {
+    "seed": 123,
+    "rows": 200,
+    "converged_rows": 200,
+    "residual_tolerance": 1e-08,
+    "maximum_scaled_residual": 6.769137828044336e-09
+  },
+  "calibration_benchmark": {
+    "rows": 12,
+    "optimization_evaluations": 40,
+    "initial_loss": 3.4481955432628384,
+    "gradient_best_loss": 0.06788441094035158,
+    "gradient_loss_reduction_percent": 98.03130622702109,
+    "powell_best_loss": 0.09925314524494512,
+    "powell_loss_reduction_percent": 97.12159174270532
+  },
+  "tests": {"passed": 27}
+}

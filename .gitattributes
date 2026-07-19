@@ -1,0 +1,13 @@
+* text=auto
+.gitattributes text eol=lf
+.gitignore text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+
+# Preserve the frozen upstream snapshot byte for byte on every operating system.
+legacy/pyLeaf.py -text
+legacy/README.original.md -text
+legacy/test_Simulation.py -text
+legacy/Input.xlsx -text
