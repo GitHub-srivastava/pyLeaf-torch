@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import time
 from pathlib import Path
 from types import ModuleType
 
@@ -99,7 +100,9 @@ def main() -> None:
 
     legacy_module = load_legacy()
     legacy_leaf = legacy_module.Leaf()
+    legacy_start = time.perf_counter()
     legacy_leaf.SeriesSolver(weather)
+    legacy_seconds = time.perf_counter() - legacy_start
     legacy_frames = {
         "state": legacy_leaf.LeafState,
         "mass": legacy_leaf.LeafMassFlux,
@@ -107,7 +110,9 @@ def main() -> None:
     }
 
     model = DifferentiableLeaf(trainable=(), mode=args.mode, dtype=torch.float64)
+    torch_start = time.perf_counter()
     _, torch_frames = simulate_dataframe(model, weather)
+    torch_seconds = time.perf_counter() - torch_start
     new_frames = {
         "state": torch_frames.state,
         "mass": torch_frames.mass,
@@ -133,6 +138,10 @@ def main() -> None:
         "mode": args.mode,
         "rows": len(weather),
         "legacy_sha256": LEGACY_HASH,
+        "runtime_seconds": {
+            "legacy_gekko": legacy_seconds,
+            "pytorch": torch_seconds,
+        },
         "legacy_solver": {
             "flagged_rows": int(legacy_frames["state"]["flag"].sum()),
             "note": "Legacy flags and iteration deltas are not parity metrics.",
@@ -176,6 +185,9 @@ def main() -> None:
     (args.output_dir / "summary.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8"
     )
+    print("\nModel runtimes")
+    print(f"  Legacy GEKKO model: {legacy_seconds:.6f} seconds")
+    print(f"  PyTorch model:      {torch_seconds:.6f} seconds")
     print(json.dumps(summary["torch_solver"], indent=2))
     print(f"Wrote comparison files to {args.output_dir}")
 
