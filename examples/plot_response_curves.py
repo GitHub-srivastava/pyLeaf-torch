@@ -1,7 +1,7 @@
-"""Compare pyLeaf and pyLeaf-torch A-Ci and A-Q response curves.
+"""Plot pyLeaf-torch A-Ci and A-Q response curves.
 
 One input-workbook row supplies the fixed environmental conditions. Two
-controlled sweeps are constructed and passed unchanged to both models:
+controlled sweeps are constructed and passed to the differentiable model:
 ambient CO2 for A-Ci, and irradiance for A-Q.
 """
 
@@ -21,16 +21,16 @@ SOURCE = REPOSITORY / "src"
 if str(SOURCE) not in sys.path:
     sys.path.insert(0, str(SOURCE))
 
-REQUIRED_PACKAGES = ("numpy", "pandas", "torch", "gekko", "matplotlib", "openpyxl")
+REQUIRED_PACKAGES = ("numpy", "pandas", "torch", "matplotlib", "openpyxl")
 missing_packages = [
     package
     for package in REQUIRED_PACKAGES
     if importlib.util.find_spec(package) is None
 ]
 if missing_packages:
-    requirements = REPOSITORY / "requirements-comparison.txt"
+    requirements = REPOSITORY / "requirements-plot.txt"
     raise SystemExit(
-        "Missing comparison dependencies: "
+        "Missing plotting dependencies: "
         + ", ".join(missing_packages)
         + "\nInstall them with the same Python interpreter:\n  "
         + f'{sys.executable} -m pip install -r "{requirements}"'
@@ -40,7 +40,6 @@ import numpy as np
 import pandas as pd
 import torch
 
-from compare_models import load_legacy
 from pyleaf_torch import DifferentiableLeaf, simulate_dataframe
 
 
@@ -65,15 +64,12 @@ def curve_input(
     return frame
 
 
-def run_pair(
+def run_curve(
     weather: pd.DataFrame,
     parameters: dict[str, Any],
     mode: str,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Run both implementations and return legacy, Torch, and diagnostics."""
-    legacy = load_legacy().Leaf(parameters)
-    legacy.SeriesSolver(weather)
-
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Run the differentiable model and return its state and diagnostics."""
     torch_model = DifferentiableLeaf(
         parameters=parameters,
         trainable=(),
@@ -82,20 +78,13 @@ def run_pair(
     )
     _, torch_frames = simulate_dataframe(torch_model, weather)
 
-    legacy_result = pd.DataFrame(
-        {
-            "aNet": legacy.LeafMassFlux["aNet"],
-            "ci": legacy.LeafState["ci"],
-            "flagged": legacy.LeafState["flag"].astype(bool),
-        }
-    )
     torch_result = pd.DataFrame(
         {
             "aNet": torch_frames.mass["aNet"],
             "ci": torch_frames.state["ci"],
         }
     )
-    return legacy_result, torch_result, torch_frames.diagnostics
+    return torch_result, torch_frames.diagnostics
 
 
 def parse_parameters(path: Path | None) -> dict[str, Any]:
@@ -112,18 +101,12 @@ def save_plot(aci: pd.DataFrame, aq: pd.DataFrame, path: Path, dpi: int) -> None
 
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.5), constrained_layout=True)
 
-    axes[0].plot(
-        aci["legacy_ci"], aci["legacy_aNet"], "o-", ms=3.5, label="pyLeaf"
-    )
-    axes[0].plot(
-        aci["torch_ci"], aci["torch_aNet"], "--", lw=2, label="pyLeaf-torch"
-    )
+    axes[0].plot(aci["ci"], aci["aNet"], "-", lw=2, label="pyLeaf-torch")
     axes[0].set_xlabel(r"Intercellular CO$_2$, $C_i$ [$\mu$mol mol$^{-1}$]")
     axes[0].set_ylabel(r"Net assimilation, $A$ [$\mu$mol m$^{-2}$ s$^{-1}$]")
     axes[0].set_title(r"A--$C_i$ response")
 
-    axes[1].plot(aq["Q"], aq["legacy_aNet"], "o-", ms=3.5, label="pyLeaf")
-    axes[1].plot(aq["Q"], aq["torch_aNet"], "--", lw=2, label="pyLeaf-torch")
+    axes[1].plot(aq["Q"], aq["aNet"], "-", lw=2, label="pyLeaf-torch")
     axes[1].set_xlabel(r"Photon flux, $Q$ [$\mu$mol photons m$^{-2}$ s$^{-1}$]")
     axes[1].set_ylabel(r"Net assimilation, $A$ [$\mu$mol m$^{-2}$ s$^{-1}$]")
     axes[1].set_title("A--Q response")
@@ -141,7 +124,7 @@ def save_plot(aci: pd.DataFrame, aq: pd.DataFrame, path: Path, dpi: int) -> None
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--input", type=Path, default=REPOSITORY / "legacy" / "Input.xlsx"
+        "--input", type=Path, default=REPOSITORY / "examples" / "data" / "Input.xlsx"
     )
     parser.add_argument(
         "--output-dir", type=Path, default=REPOSITORY / "curve_comparison_output"
@@ -161,7 +144,7 @@ def main() -> None:
     parser.add_argument(
         "--parameters",
         type=Path,
-        help="optional JSON object of parameter overrides, used by both models",
+        help="optional JSON object of parameter overrides",
     )
     parser.add_argument("--dpi", type=int, default=200)
     args = parser.parse_args()
@@ -186,19 +169,16 @@ def main() -> None:
     aci_weather = curve_input(base, ca_values, "ca")
     aq_weather = curve_input(base, par_values, "PAR", scale_nir=True)
 
-    legacy_aci, torch_aci, diag_aci = run_pair(aci_weather, parameters, args.mode)
-    legacy_aq, torch_aq, diag_aq = run_pair(aq_weather, parameters, args.mode)
+    torch_aci, diag_aci = run_curve(aci_weather, parameters, args.mode)
+    torch_aq, diag_aq = run_curve(aq_weather, parameters, args.mode)
 
     aci = pd.DataFrame(
         {
             "ca": ca_values,
-            "legacy_ci": legacy_aci["ci"],
-            "legacy_aNet": legacy_aci["aNet"],
-            "torch_ci": torch_aci["ci"],
-            "torch_aNet": torch_aci["aNet"],
-            "legacy_flagged": legacy_aci["flagged"],
-            "torch_converged": diag_aci["converged"],
-            "torch_residual_norm": diag_aci["residual_norm"],
+            "ci": torch_aci["ci"],
+            "aNet": torch_aci["aNet"],
+            "converged": diag_aci["converged"],
+            "residual_norm": diag_aci["residual_norm"],
         }
     )
     aq = pd.DataFrame(
@@ -206,28 +186,24 @@ def main() -> None:
             "PAR": par_values,
             "Q": par_values * PAR_TO_Q,
             "NIR": aq_weather["NIR"],
-            "legacy_ci": legacy_aq["ci"],
-            "legacy_aNet": legacy_aq["aNet"],
-            "torch_ci": torch_aq["ci"],
-            "torch_aNet": torch_aq["aNet"],
-            "legacy_flagged": legacy_aq["flagged"],
-            "torch_converged": diag_aq["converged"],
-            "torch_residual_norm": diag_aq["residual_norm"],
+            "ci": torch_aq["ci"],
+            "aNet": torch_aq["aNet"],
+            "converged": diag_aq["converged"],
+            "residual_norm": diag_aq["residual_norm"],
         }
     )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    aci.to_csv(args.output_dir / "A_Ci_comparison.csv", index=False)
-    aq.to_csv(args.output_dir / "A_Q_comparison.csv", index=False)
-    figure = args.output_dir / "A_Ci_A_Q_comparison.png"
+    aci.to_csv(args.output_dir / "A_Ci_curve.csv", index=False)
+    aq.to_csv(args.output_dir / "A_Q_curve.csv", index=False)
+    figure = args.output_dir / "A_Ci_A_Q_curves.png"
     save_plot(aci, aq, figure, args.dpi)
 
     print(f"Base input row: {args.base_row} ({args.input})")
     print(
-        "Solver status: "
-        f"legacy flagged {int(aci['legacy_flagged'].sum() + aq['legacy_flagged'].sum())}, "
-        f"Torch converged {int(aci['torch_converged'].sum() + aq['torch_converged'].sum())}"
-        f"/{2 * args.points} curve points"
+        "Solver status: converged "
+        f"{int(aci['converged'].sum() + aq['converged'].sum())}/{2 * args.points} "
+        "curve points"
     )
     print(f"Wrote figure and curve data to {args.output_dir}")
 

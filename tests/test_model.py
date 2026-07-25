@@ -69,8 +69,11 @@ def test_vpr25_is_structurally_unused(weather) -> None:
     with torch.no_grad():
         low_output = low(weather)
         high_output = high(weather)
-    assert torch.equal(low_output.mass["aNet"], high_output.mass["aNet"])
-    assert torch.equal(low_output.state["gs"], high_output.state["gs"])
+    # atol is near float64 machine epsilon: multi-threaded reduction ordering in
+    # the iterative solver can perturb the last bit even when, as here, vpr25
+    # never enters the computation graph.
+    assert torch.allclose(low_output.mass["aNet"], high_output.mass["aNet"], rtol=0.0, atol=1.0e-12)
+    assert torch.allclose(low_output.state["gs"], high_output.state["gs"], rtol=0.0, atol=1.0e-12)
 
 
 def test_implicit_gradient_matches_central_difference(weather) -> None:

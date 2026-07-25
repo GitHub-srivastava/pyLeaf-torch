@@ -1,46 +1,7 @@
 # Validation results
 
 These results were produced in the repository's isolated environment on
-2026-07-19 with Python 3.12.4, PyTorch 2.13.0+cpu, NumPy 2.5.1, pandas 3.0.3,
-and GEKKO 1.3.2.
-
-## Frozen legacy versus hard Torch equilibrium
-
-Command:
-
-```bash
-python examples/compare_models.py --mode hard
-```
-
-Dataset: all 55 rows of `legacy/Input.xlsx` with default model parameters.
-
-| Check | Legacy snapshot | Torch hard mode |
-|---|---:|---:|
-| Rows | 55 | 55 |
-| Legacy/Torch failure flag | 0 | 0 |
-| Rows below Torch full-residual tolerance (`1e-7`) | 0 | 55 |
-| Median scaled coupled residual | 0.009295 | below tolerance |
-| Maximum scaled coupled residual | 0.166228 | 6.090e-8 |
-| Maximum Torch solve iterations | n/a | 7 |
-
-The strict residual is evaluated by recomputing all corrected coupled equations
-at each final state. It is not the legacy code's looser iteration-change metric.
-The legacy implementation still completed every sample row without setting its
-CO2 iteration-limit flag.
-
-Key output agreement:
-
-| Output | Mean absolute difference | Maximum absolute difference | MAE / mean absolute legacy value |
-|---|---:|---:|---:|
-| `aNet` (umol m^-2 s^-1) | 0.02005 | 0.07364 | 0.055% |
-| `tLeaf` (deg C) | 0.00624 | 0.05665 | 0.021% |
-| `gs` (mol m^-2 s^-1) | 0.001069 | 0.016623 | 0.381% |
-| `transpiration` (umol m^-2 s^-1) | 9.923 | 89.879 | 0.294% |
-
-This is the desired pattern: small changes in public predictions, alongside a
-much tighter internally consistent final equilibrium. The largest low-light
-`gs`, temperature, and transpiration changes reflect the intentional correction
-`gs >= go`; the legacy attempted floor changes its Jacobian but not its residual.
+2026-07-19 with Python 3.12.4, PyTorch 2.13.0+cpu, NumPy 2.5.1, and pandas 3.0.3.
 
 ## Broad forward-convergence stress grid
 
@@ -100,10 +61,10 @@ seeds, starts, held-out rows, and matched wall-clock as well as evaluation caps.
 ## Automated suite
 
 ```text
-27 passed
+26 passed
 ```
 
-The suite covers legacy provenance, fixed-temperature and energy equilibria,
-physical identities, implicit and finite gradients, unused-parameter sensitivity,
-inference mode, parameter/solver validation, difficult-row multi-start recovery,
-and DataFrame input/output behavior.
+The suite covers fixed-temperature and energy equilibria, physical identities,
+implicit and finite gradients, unused-parameter sensitivity, inference mode,
+parameter/solver validation, difficult-row multi-start recovery, and DataFrame
+input/output behavior.

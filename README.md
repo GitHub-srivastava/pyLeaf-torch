@@ -1,18 +1,12 @@
 # pyLeaf Torch
 
-This repository contains both versions needed for a controlled comparison:
+`src/pyleaf_torch/` is a differentiable C4 leaf gas-exchange and
+energy-balance model implemented with PyTorch. It solves the coupled
+equilibrium (`aNet`, `cbs`, `ci`, `gs`, `cb`, `tLeaf`) with a scaled damped
+root solver and differentiates the converged solution with the
+implicit-function theorem.
 
-- `legacy/pyLeaf.py` is a byte-for-byte snapshot of the current NumPy/GEKKO
-  implementation at upstream commit `e96a34cae637687e4f6d4e0d55aaa27bf4381aa3`.
-- `src/pyleaf_torch/` is a new C4 leaf model implemented with PyTorch. It solves
-  the coupled equilibrium with a scaled damped root solver and differentiates
-  the converged solution with the implicit-function theorem.
-
-The existing upstream repository was not edited. The legacy snapshot has SHA-256
-`d14cd68d3ae90dcfd2d993ef379b4ef7a06f21b55941ad801fa3e95e55797efd`,
-and a test protects it from accidental changes.
-
-Measured parity, residual, stress-grid, gradient, and calibration results are in
+Measured residual, stress-grid, gradient, and calibration results are in
 [VALIDATION.md](VALIDATION.md).
 
 ## What differentiability does—and does not—help
@@ -57,7 +51,7 @@ python -m venv .venv
 ```
 
 For the Torch tensor model alone, `pip install -e .` is enough. The `all` extra
-adds pandas/Excel adapters, GEKKO legacy comparison, SciPy benchmark, and tests.
+adds pandas/Excel adapters, Matplotlib plotting, SciPy benchmark, and tests.
 The model defaults to `torch.float64` because the physical variables span several
 orders of magnitude.
 
@@ -69,7 +63,7 @@ import torch
 
 from pyleaf_torch import DifferentiableLeaf, weather_from_dataframe
 
-frame = pd.read_excel("legacy/Input.xlsx")
+frame = pd.read_excel("examples/data/Input.xlsx")
 weather = weather_from_dataframe(frame)
 
 model = DifferentiableLeaf(
@@ -113,23 +107,13 @@ members of `tensor_output`, not against `frames`.
 A practical workflow is to calibrate in smooth mode, reduce the learning rate,
 then evaluate/refine in hard mode. Always report which mode was used.
 
-Both modes enforce `gs >= go`. This intentionally corrects the legacy code's
-inconsistent stomatal-floor Jacobian branch and changes some dark or negative-
-assimilation outputs.
+Both modes enforce `gs >= go` exactly, by construction of the smooth/hard
+maximum used for the stomatal floor.
 
-## Compare the two implementations
+## Response curve plotting
 
-The comparison script runs the frozen GEKKO code and the new hard or smooth
-equilibrium on the same workbook. It writes side-by-side values, absolute and
-relative differences, solver diagnostics, and limitation regimes.
-
-```bash
-python examples/compare_models.py --mode hard
-```
-
-To generate overlaid A-Ci and A-Q response curves from identical parameters and
-environmental inputs, create an isolated environment and install the comparison
-dependency set once:
+To generate A-Ci and A-Q response curves from a weather workbook, create an
+isolated environment and install the plotting dependency set once:
 
 ```bash
 git clone <repository-url>
@@ -140,29 +124,24 @@ python -m venv .venv
 On Windows PowerShell:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements-comparison.txt
+.\.venv\Scripts\python.exe -m pip install -r requirements-plot.txt
 .\.venv\Scripts\python.exe examples\plot_response_curves.py
 ```
 
 On macOS or Linux:
 
 ```bash
-.venv/bin/python -m pip install -r requirements-comparison.txt
+.venv/bin/python -m pip install -r requirements-plot.txt
 .venv/bin/python examples/plot_response_curves.py
 ```
 
-The last row of `legacy/Input.xlsx` supplies the fixed conditions. The script
-performs controlled ambient-CO2 and irradiance sweeps, saves a PNG figure, and
-writes both curves (including solver status) as CSV files under
+The last row of `examples/data/Input.xlsx` supplies the fixed conditions. The
+script performs controlled ambient-CO2 and irradiance sweeps, saves a PNG
+figure, and writes both curves (including solver status) as CSV files under
 `curve_comparison_output/`. Run it with `--help` to see sweep, input-row,
 parameter-JSON, and output options. If it is launched with an interpreter that
 does not have the required packages, it reports every missing dependency and
 the exact installation command instead of failing on an import traceback.
-
-Outputs go to `comparison_output/`. The new solver intentionally corrects stale
-state dependencies and convergence checks, so agreement should be judged along
-with the new equation residual—not by forcing exact equality with a legacy state
-that stopped early.
 
 ## Calibration convergence benchmark
 
@@ -182,26 +161,27 @@ both evaluation and wall-time budgets, and analyze the sensitivity matrix rank.
 
 ## Important model findings
 
-- The equations remain C4-only. The legacy `plant` column is validated but never
-  used; the new DataFrame adapter rejects values other than `4` explicitly.
+- The equations remain C4-only. The `plant` column is validated but never used;
+  the DataFrame adapter rejects values other than `4` explicitly.
 - `vpr25` is stored but unused in the current equations, so its output sensitivity
   is exactly zero. The literal PEP-regeneration cap of `100` is preserved rather
   than silently replacing it with `vpr25`; attempts to train it are rejected.
-- A single PAR curve such as `legacy/Input.xlsx` cannot identify the full
+- A single PAR curve such as `examples/data/Input.xlsx` cannot identify the full
   parameter set. In particular, `jmax25`, `theta`, and `x`; `vpmax25`, `gbs`, and
   `x`; `vcmax25` and `rd25`; and `go` and `g1` can be strongly correlated.
 - Hard minima give little or no information about an inactive capacity. Vary PAR,
   CO2, temperature, humidity, and wind, and measure more than `aNet` when fitting.
 - A singular/ill-conditioned equilibrium Jacobian makes implicit gradients
   unreliable. Inspect `output.diagnostics.jacobian_condition` and residuals.
-- `gbForced` and `gbFree` retain the legacy m/s convention, while `gb` is converted
-  to mol m^-2 s^-1. `L` is bundle-sheath leak flux, and `cb` is leaf-surface CO2.
+- `gbForced` and `gbFree` use the m/s boundary-layer convection convention, while
+  `gb` is converted to mol m^-2 s^-1. `L` is bundle-sheath leak flux, and `cb` is
+  leaf-surface CO2.
 - Wind must be strictly positive. An exact zero-wind, zero-buoyancy state has no
   boundary transfer and makes the gas-transport equations undefined, so it is
   rejected with a clear validation error.
 
-See [MODEL_NOTES.md](MODEL_NOTES.md) for equations, compatibility differences,
-and interpretation of diagnostics.
+See [MODEL_NOTES.md](MODEL_NOTES.md) for equations, numerical design, and
+interpretation of diagnostics.
 
 ## Test
 
@@ -209,19 +189,18 @@ and interpretation of diagnostics.
 python -m pytest
 ```
 
-Tests cover every frozen legacy hash, physical identities, hard/smooth equilibrium,
-energy balance, nonzero parameter gradients, the zero influence of `vpr25`, an
-implicit-gradient finite-difference check, inference mode, staged multi-start,
-invalid-root/parameter handling, solver options, and the pandas adapter.
+Tests cover physical identities, hard/smooth equilibrium, energy balance,
+nonzero parameter gradients, the zero influence of `vpr25`, an implicit-gradient
+finite-difference check, inference mode, staged multi-start, invalid-root/
+parameter handling, solver options, and the pandas adapter.
 
 ## Repository layout
 
 ```text
-legacy/                       frozen current NumPy/GEKKO implementation
-src/pyleaf_torch/             differentiable Torch package
-examples/compare_models.py    output comparison harness
-examples/plot_response_curves.py  overlaid A-Ci and A-Q curves
-examples/calibration_benchmark.py
-tests/                        solver, gradient, adapter, and provenance tests
-MODEL_NOTES.md                numerical/scientific design notes
+src/pyleaf_torch/                 differentiable Torch package
+examples/plot_response_curves.py  A-Ci and A-Q response curves
+examples/calibration_benchmark.py autograd vs. derivative-free calibration
+examples/data/Input.xlsx          sample weather workbook
+tests/                            solver, gradient, and adapter tests
+MODEL_NOTES.md                    numerical/scientific design notes
 ```

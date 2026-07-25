@@ -25,17 +25,18 @@ temperature responses, electron transport, limitation rates, boundary layer,
 stomatal coupling, compensation point, and energy fluxes are recomputed from the
 current state during every residual evaluation.
 
-Smooth mode replaces the hard maximum in `gs*` with a narrow smooth maximum.
-This floor intentionally corrects the legacy code's inconsistent intended floor:
-the old Jacobian branch tried to clamp `gs`, but its residual did not.
+Smooth mode replaces the hard maximum in `gs*` with a narrow smooth maximum,
+so the `gs >= go` floor is enforced consistently in both the residual and its
+Jacobian.
 
 The solver uses state scales `[10, 1000, 100, 0.1, 100, 10]` and residual scales
 `[10, 1000, 100, 0.1, 100, 100]` (temperature residual scale `10` in fixed mode).
 It solves an augmented damped least-squares system (avoiding `J.T @ J`), applies
 state bounds, and uses squared-L2 backtracking consistent with that step.
 Convergence is based on the infinity norm of the complete scaled residual.
-Rows that fail from the legacy-like assimilation start are retried from three
-additional assimilation guesses; the lowest-residual result is retained.
+Rows that fail from the default `aNet = 0.1*ca` assimilation start are retried
+from three additional physiology-informed assimilation guesses; the
+lowest-residual result is retained.
 
 ## Implicit differentiation
 
@@ -55,28 +56,12 @@ nonconverged, bound-active, or unsolvable-Jacobian row. This construction suppor
 correct first derivatives only; higher-order autograd is not supported because
 the equilibrium Jacobian is detached.
 
-## Why exact legacy equality is not expected
+## Energy-balance convergence
 
-The legacy code uses a nested Picard/Newton/GEKKO process. Its hand-written CO2
-Jacobian freezes quantities that depend on the current state; its stomatal-floor
-branch changes Jacobian entries without changing the corresponding residual; and
-its final reported derived rates can precede the last state or temperature update.
-The inner stopping metric mixes unscaled changes in `aNet`, `ci`, and `gs`, while
-the outer loop checks only temperature change.
-
-The new solver preserves the equilibrium equations and constants but corrects
-those numerical inconsistencies. Therefore:
-
-- use the hard mode and `examples/compare_models.py` to quantify output changes;
-- compare limitation regimes as well as values;
-- inspect the new full-equation residual;
-- do not make a converged corrected solution imitate an unconverged/stale legacy
-  output merely to reduce a parity metric.
-
-The energy solver is also different. Legacy GEKKO minimizes a squared energy
-residual with `2 <= T_leaf <= 60`. The new model solves the coupled bounded
-equilibrium. If no zero exists inside those bounds, it reports a nonzero residual
-and a bound-active diagnostic rather than calling the row converged.
+The model solves the coupled bounded equilibrium with `2 <= T_leaf <= 60`. If no
+zero exists inside those bounds, it reports a nonzero residual and a
+bound-active diagnostic (`output.diagnostics.at_state_bound`) rather than
+calling the row converged.
 
 ## Differentiability limits
 
@@ -105,7 +90,7 @@ Do not fit `vpr25` without first changing and scientifically validating the mode
 the current equations never use it. Do not silently interpret the literal `100`
 PEP cap as `vpr25`; that would be a new biological assumption.
 
-Legacy `flag`, `Terror`, `Aerror`, `Cierror`, and `Gserror` values are iteration
-diagnostics, not physical outputs. The Torch DataFrame puts explicitly named
-scaled equation components in its diagnostics table instead; the comparison
-harness excludes legacy diagnostic columns from parity metrics.
+The Torch DataFrame puts explicitly named scaled equation components
+(`scaled_residual_aNet`, `scaled_residual_cbs`, ...) plus `converged`,
+`iterations`, `residual_norm`, `jacobian_condition`, `line_search_failures`,
+and `at_state_bound` in its diagnostics table for exactly this purpose.

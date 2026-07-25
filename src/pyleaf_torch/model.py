@@ -695,8 +695,8 @@ class DifferentiableLeaf(nn.Module):
     ) -> Tensor:
         """Evaluate all coupled equations at a supplied physical state.
 
-        This is useful for checking legacy or externally generated states. State
-        columns are ordered as ``aNet, cbs, ci, gs, cb, tLeaf`` when a tensor is
+        This is useful for checking externally generated states. State columns
+        are ordered as ``aNet, cbs, ci, gs, cb, tLeaf`` when a tensor is
         supplied. The operation remains differentiable.
         """
 

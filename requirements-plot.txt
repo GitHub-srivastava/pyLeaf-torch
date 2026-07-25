@@ -1,8 +1,7 @@
-# Dependencies needed by both models, Excel input, and comparison plots.
+# Dependencies needed by the response-curve plotting example.
 # pyLeaf-torch itself is imported directly from this repository's src folder.
 torch>=2.2
 numpy>=1.26
 pandas>=2.1
 openpyxl>=3.1
-gekko>=1.0
 matplotlib>=3.8
