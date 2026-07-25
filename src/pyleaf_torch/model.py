@@ -22,60 +22,32 @@ from .solver import SolverOptions, implicit_root, select_better_root, solve_root
 Mode = Literal["hard", "smooth"]
 
 
-class DifferentiableLeaf(nn.Module):
-    """C4 leaf model with a batched Torch root solve and implicit gradients.
+class _C4Model(nn.Module):
+    """Shared constrained-parameter machinery and C4 biochemistry equations.
 
-    Parameters are represented in valid physical domains. Only names listed in
-    ``trainable`` become :class:`torch.nn.Parameter` objects; all others are
-    fixed buffers. The tensor-only forward path is differentiable with respect
-    to trainable parameters and tensor weather forcings.
-
-    ``mode="hard"`` retains exact limitation switches and is piecewise
-    differentiable. ``mode="smooth"`` rounds switch surfaces slightly to make
-    calibration gradients continuous near regime changes.
+    Subclassed by :class:`Leaf` (the full coupled, ``ca``-driven leaf with
+    stomata, boundary layer, and optional energy balance) and
+    :class:`LeafBiochemistry` (a reduced, ``ci``-driven model for fitting
+    measured A-Ci curve data, with no stomatal/boundary-layer/energy-balance
+    equations). Both share the parameter transform machinery, the Arrhenius
+    temperature response, and the CO2/light-limited C4 assimilation equations.
     """
-
-    WEATHER_COLUMNS = (
-        "ca",
-        "O2",
-        "tAir",
-        "ea",
-        "pressure",
-        "wind",
-        "PAR",
-        "long",
-        "NIR",
-    )
-
-    STATE_NAMES = ("aNet", "cbs", "ci", "gs", "cb", "tLeaf")
 
     def __init__(
         self,
-        parameters: Mapping[str, float] | None = None,
+        parameters: Mapping[str, float] | None,
         *,
-        trainable: Iterable[str] = (
-            "vcmax25",
-            "vpmax25",
-            "jmax25",
-            "rd25",
-            "go",
-            "g1",
-        ),
-        mode: Mode = "hard",
-        energy_balance: bool | None = None,
-        solver_options: SolverOptions | None = None,
-        dtype: torch.dtype = torch.float64,
-        device: torch.device | str | None = None,
-        boundary_iterations: int = 8,
+        trainable: Iterable[str],
+        mode: Mode,
+        solver_options: SolverOptions | None,
+        dtype: torch.dtype,
+        device: torch.device | str | None,
     ) -> None:
         super().__init__()
         if mode not in ("hard", "smooth"):
             raise ValueError("mode must be 'hard' or 'smooth'")
-        if boundary_iterations < 1:
-            raise ValueError("boundary_iterations must be positive")
 
         supplied = dict(parameters or {})
-        parameter_energy_switch = supplied.pop("energySwitch", None)
         unknown = sorted(set(supplied) - set(DEFAULT_PARAMETERS))
         if unknown:
             raise KeyError(f"Unknown pyLeaf parameter(s): {', '.join(unknown)}")
@@ -92,11 +64,6 @@ class DifferentiableLeaf(nn.Module):
             raise ValueError(
                 "vpr25 cannot be trainable because the preserved pyLeaf equations "
                 "do not use it; the literal PEP-regeneration cap remains 100"
-            )
-
-        if energy_balance is None:
-            energy_balance = (
-                True if parameter_energy_switch is None else bool(parameter_energy_switch)
             )
 
         for name, value in values.items():
@@ -122,13 +89,12 @@ class DifferentiableLeaf(nn.Module):
                 )
 
         self.mode: Mode = mode
-        self.energy_balance = bool(energy_balance)
         self.solver_options = solver_options or SolverOptions()
-        self.boundary_iterations = boundary_iterations
         self.raw_parameters = nn.ParameterDict()
         self._trainable_names = trainable_names
 
         factory = {"dtype": dtype, "device": device}
+        self.register_buffer("_reference", torch.zeros((), **factory))
         for name, value in values.items():
             physical = torch.tensor(value, **factory)
             spec = PARAMETER_SPECS[name]
@@ -150,19 +116,6 @@ class DifferentiableLeaf(nn.Module):
                 self.raw_parameters[name] = nn.Parameter(raw)
             else:
                 self.register_buffer(f"_fixed_{name}", physical)
-
-        self.register_buffer(
-            "state_scale",
-            torch.tensor([10.0, 1000.0, 100.0, 0.1, 100.0, 10.0], **factory),
-        )
-        self.register_buffer(
-            "state_lower",
-            torch.tensor([-20.0, 0.1, 0.1, 1.0e-4, 0.1, -20.0], **factory),
-        )
-        self.register_buffer(
-            "state_upper",
-            torch.tensor([150.0, 20000.0, 5000.0, 5.0, 5000.0, 70.0], **factory),
-        )
 
     @property
     def trainable_parameter_names(self) -> tuple[str, ...]:
@@ -193,7 +146,7 @@ class DifferentiableLeaf(nn.Module):
 
         if name not in DEFAULT_PARAMETERS:
             raise KeyError(f"Unknown pyLeaf parameter: {name}")
-        reference = self.state_scale
+        reference = self._reference
         physical = torch.as_tensor(value, dtype=reference.dtype, device=reference.device)
         spec = PARAMETER_SPECS[name]
         if not bool(torch.isfinite(physical)):
@@ -215,41 +168,6 @@ class DifferentiableLeaf(nn.Module):
                 self.raw_parameters[name].copy_(to_raw(physical, spec))
             else:
                 getattr(self, f"_fixed_{name}").copy_(physical)
-
-    def _prepare_weather(self, weather: Mapping[str, Any]) -> dict[str, Tensor]:
-        required = list(self.WEATHER_COLUMNS)
-        if not self.energy_balance:
-            required.append("controlTemp")
-        missing = [name for name in required if name not in weather]
-        if missing:
-            raise KeyError(f"Missing weather field(s): {', '.join(missing)}")
-
-        tensors: list[Tensor] = []
-        for name in required:
-            value = torch.as_tensor(
-                weather[name], dtype=self.state_scale.dtype, device=self.state_scale.device
-            )
-            if value.ndim == 0:
-                value = value.reshape(1)
-            if value.ndim != 1:
-                raise ValueError(f"Weather field {name!r} must be scalar or one-dimensional")
-            tensors.append(value)
-        tensors = list(torch.broadcast_tensors(*tensors))
-        prepared = dict(zip(required, tensors, strict=True))
-
-        detached = {name: value.detach() for name, value in prepared.items()}
-        if any(not bool(torch.isfinite(value).all()) for value in detached.values()):
-            raise ValueError("Weather fields must contain only finite values")
-        if bool((detached["pressure"] <= 0).any()):
-            raise ValueError("Weather field 'pressure' must be positive")
-        if bool((detached["wind"] <= 0).any()):
-            raise ValueError(
-                "Weather field 'wind' must be positive; zero wind can create "
-                "an undefined zero-transfer boundary state"
-            )
-        if bool((detached["ea"] < 0).any()):
-            raise ValueError("Weather field 'ea' must be non-negative")
-        return prepared
 
     @staticmethod
     def _safe_denominator(value: Tensor, epsilon: float = 1.0e-10) -> Tensor:
@@ -310,6 +228,13 @@ class DifferentiableLeaf(nn.Module):
         jmax = peaked_response(parameters["jmax25"], 77900.0, 627.0, 191929.0)
         vcmax = peaked_response(parameters["vcmax25"], 67294.0, 472.0, 144568.0)
         vpmax = peaked_response(parameters["vpmax25"], 70373.0, 376.0, 117910.0)
+        # Peaked-Arrhenius gm(T) adapted from Bernacchi et al. (2002, Plant,
+        # Cell & Environment 25:851-858), the standard C3 gm temperature
+        # response used by most FvCB fitting tools; C4-specific gm(T) data is
+        # sparse, so this is a documented placeholder, not a measured C4
+        # value. Computed unconditionally and harmlessly unused when
+        # finite_gm=False, the same pattern as the unused vpr25.
+        gm = peaked_response(parameters["gm25"], 49600.0, 1400.0, 437400.0)
         sco = parameters["sco25"] * 1.0e-3 * torch.exp(
             -55900.0
             * (kelvin - reference_kelvin)
@@ -325,72 +250,48 @@ class DifferentiableLeaf(nn.Module):
             "jmax": jmax,
             "vcmax": vcmax,
             "vpmax": vpmax,
+            "gm": gm,
             "gammaStarRatio": gamma_star_ratio,
             "rd": rd,
             "rm": 0.5 * rd,
             "rbs": 0.5 * rd,
         }
 
-    def _derived(
+    def _biochemistry_core(
         self,
-        state: Tensor,
-        weather: Mapping[str, Tensor],
+        a_net: Tensor,
+        cbs: Tensor,
+        site_co2: Tensor,
+        t_leaf: Tensor,
+        par: Tensor,
+        o2: Tensor,
         parameters: Mapping[str, Tensor],
     ) -> dict[str, Tensor]:
-        a_net, cbs, ci, gs, cb, t_leaf = state.unbind(dim=-1)
+        """CO2/light-limited C4 assimilation, shared by both model classes.
+
+        ``site_co2`` is the CO2 partial pressure at the PEP-carboxylation
+        site: the coupled state ``cm`` when mesophyll conductance is finite,
+        or ``ci`` directly under the infinite-gm assumption. This method does
+        not touch stomatal conductance, boundary-layer transfer, or energy
+        balance, so it is identical for :class:`Leaf` and
+        :class:`LeafBiochemistry`.
+        """
+
         response = self._temperature_response(t_leaf, parameters)
-        temperature_kelvin = weather["tAir"] + 273.15
-        leaf_kelvin = t_leaf + 273.15
-        mb = 0.5 * (1.0 + parameters["s"]) ** 2 / (1.0 + parameters["s"] ** 2)
-        conversion_gb = weather["pressure"] / (8.309 * temperature_kelvin)
-
-        gb_forced = parameters["cForced"] * temperature_kelvin**0.56 * (
-            (temperature_kelvin + 120.0)
-            * (weather["wind"] / parameters["leafDim"] / weather["pressure"])
-        ) ** 0.5
-
-        gb_mps = gb_forced
-        gb = gb_mps * conversion_gb
-        eb = (gs * response["ei"] + gb * mb * weather["ea"]) / self._safe_denominator(
-            gs + gb * mb
-        )
-        gb_free = torch.zeros_like(gb_forced)
-        for _ in range(self.boundary_iterations):
-            virtual_difference = leaf_kelvin / self._safe_denominator(
-                1.0 - 0.378 * eb / weather["pressure"]
-            ) - temperature_kelvin / self._safe_denominator(
-                1.0 - 0.378 * weather["ea"] / weather["pressure"]
-            )
-            gb_free = parameters["cFree"] * leaf_kelvin**0.56 * (
-                ((leaf_kelvin + 120.0) / weather["pressure"]) ** 0.5
-                * (
-                    self._absolute(virtual_difference, 1.0e-3)
-                    / parameters["leafDim"]
-                )
-                ** 0.25
-            )
-            gb_mps = self._maximum(gb_free, gb_forced, 1.0e-6)
-            gb = gb_mps * conversion_gb
-            eb = (
-                gs * response["ei"] + gb * mb * weather["ea"]
-            ) / self._safe_denominator(gs + gb * mb)
-
-        total_conductance = gs * gb * mb / self._safe_denominator(gs + gb * mb)
         phi_ps2 = 0.352 + 0.022 * t_leaf - 3.4 * t_leaf.square() / 10000.0
-        light = weather["PAR"] * 4.57 * phi_ps2 / 2.0
+        light = par * 4.57 * phi_ps2 / 2.0
         electron_discriminant = (light + response["jmax"]) ** 2 - (
             4.0 * parameters["theta"] * light * response["jmax"]
         )
         electron_discriminant = torch.clamp(
-            electron_discriminant, min=torch.finfo(state.dtype).tiny
+            electron_discriminant, min=torch.finfo(a_net.dtype).tiny
         )
         electron_transport = (
             light + response["jmax"] - torch.sqrt(electron_discriminant)
         ) / (2.0 * parameters["theta"])
 
         obs = (
-            parameters["alpha"] * a_net / (0.047 * parameters["gbs"] * 1000.0)
-            + weather["O2"]
+            parameters["alpha"] * a_net / (0.047 * parameters["gbs"] * 1000.0) + o2
         )
         gamma_star = response["gammaStarRatio"] * obs
         vc_light = cbs * (1.0 - parameters["x"]) * electron_transport / (
@@ -402,13 +303,13 @@ class DifferentiableLeaf(nn.Module):
         vc = self._minimum(vc_co2, vc_light, 0.05)
 
         vp_light = parameters["x"] * electron_transport / 2.0
-        vp_co2_uncapped = ci * response["vpmax"] / (ci + response["Kp"])
+        vp_co2_uncapped = site_co2 * response["vpmax"] / (site_co2 + response["Kp"])
         hundred = torch.full_like(vp_co2_uncapped, 100.0)
         vp_co2 = self._minimum(vp_co2_uncapped, hundred, 0.05)
         vp = self._minimum(vp_light, vp_co2, 0.05)
 
         if self.mode == "hard":
-            enzyme_weight = (vc_co2 < vc_light).to(state.dtype)
+            enzyme_weight = (vc_co2 < vc_light).to(a_net.dtype)
         else:
             enzyme_weight = torch.sigmoid((vc_light - vc_co2) / 0.05)
         a1 = enzyme_weight * response["vcmax"] + (1.0 - enzyme_weight) * (
@@ -439,7 +340,7 @@ class DifferentiableLeaf(nn.Module):
         )
         gamma_discriminant = torch.clamp(
             quadratic_b.square() - 4.0 * quadratic_a * quadratic_c,
-            min=torch.finfo(state.dtype).tiny,
+            min=torch.finfo(a_net.dtype).tiny,
         )
         gamma_sqrt = torch.sqrt(gamma_discriminant)
         gamma_standard = (-quadratic_b + gamma_sqrt) / (2.0 * quadratic_a)
@@ -448,13 +349,221 @@ class DifferentiableLeaf(nn.Module):
         )
         gamma = torch.where(quadratic_b >= 0.0, gamma_rational, gamma_standard)
 
+        carboxylation_factor = 1.0 - response["gammaStarRatio"] * obs / cbs
+        return {
+            **response,
+            "obs": obs,
+            "GammaStar": gamma_star,
+            "J": electron_transport,
+            "vcLight": vc_light,
+            "vcCO2": vc_co2,
+            "vc": vc,
+            "vpLight": vp_light,
+            "vpCO2": vp_co2,
+            "vpCO2Uncapped": vp_co2_uncapped,
+            "vp": vp,
+            "a1": a1,
+            "b1": b1,
+            "enzymeWeight": enzyme_weight,
+            "Gamma_C": gamma_c,
+            "Gamma": gamma,
+            "acCO2": carboxylation_factor * vc_co2 - response["rd"],
+            "acLight": carboxylation_factor * vc_light - response["rd"],
+            "apCO2": carboxylation_factor * vp_co2 - response["rd"],
+            "apLight": carboxylation_factor * vp_light - response["rd"],
+        }
+
+
+class Leaf(_C4Model):
+    """C4 leaf model with a batched Torch root solve and implicit gradients.
+
+    Parameters are represented in valid physical domains. Only names listed in
+    ``trainable`` become :class:`torch.nn.Parameter` objects; all others are
+    fixed buffers. The tensor-only forward path is differentiable with respect
+    to trainable parameters and tensor weather forcings.
+
+    ``mode="hard"`` retains exact limitation switches and is piecewise
+    differentiable. ``mode="smooth"`` rounds switch surfaces slightly to make
+    calibration gradients continuous near regime changes.
+
+    ``finite_gm`` toggles mesophyll conductance. By default (``False``) the
+    model uses the original infinite-``gm`` assumption: PEP carboxylation
+    draws directly from ``ci``, with no resistance between the intercellular
+    airspace and the mesophyll cytosol. When ``True``, a 7th coupled state
+    ``cm`` (``Cm = Ci - aNet/gm``, ``gm`` temperature-scaled like
+    ``vcmax``/``jmax``/``vpmax``) is solved and used for PEP carboxylation and
+    the bundle-sheath mass balance instead. See MODEL_NOTES.md.
+    """
+
+    WEATHER_COLUMNS = (
+        "ca",
+        "O2",
+        "tAir",
+        "ea",
+        "pressure",
+        "wind",
+        "PAR",
+        "long",
+        "NIR",
+    )
+
+    def __init__(
+        self,
+        parameters: Mapping[str, float] | None = None,
+        *,
+        trainable: Iterable[str] = (
+            "vcmax25",
+            "vpmax25",
+            "jmax25",
+            "rd25",
+            "go",
+            "g1",
+        ),
+        mode: Mode = "hard",
+        energy_balance: bool | None = None,
+        finite_gm: bool = False,
+        solver_options: SolverOptions | None = None,
+        dtype: torch.dtype = torch.float64,
+        device: torch.device | str | None = None,
+        boundary_iterations: int = 8,
+    ) -> None:
+        if boundary_iterations < 1:
+            raise ValueError("boundary_iterations must be positive")
+
+        supplied = dict(parameters or {})
+        parameter_energy_switch = supplied.pop("energySwitch", None)
+        if energy_balance is None:
+            energy_balance = (
+                True if parameter_energy_switch is None else bool(parameter_energy_switch)
+            )
+
+        super().__init__(
+            supplied,
+            trainable=trainable,
+            mode=mode,
+            solver_options=solver_options,
+            dtype=dtype,
+            device=device,
+        )
+        self.energy_balance = bool(energy_balance)
+        self.finite_gm = bool(finite_gm)
+        self.boundary_iterations = boundary_iterations
+        self.STATE_NAMES = (
+            ("aNet", "cbs", "ci", "cm", "gs", "cb", "tLeaf")
+            if self.finite_gm
+            else ("aNet", "cbs", "ci", "gs", "cb", "tLeaf")
+        )
+
+        factory = {"dtype": dtype, "device": device}
+        if self.finite_gm:
+            state_scale = [10.0, 1000.0, 100.0, 100.0, 0.1, 100.0, 10.0]
+            state_lower = [-20.0, 0.1, 0.1, 0.1, 1.0e-4, 0.1, -20.0]
+            state_upper = [150.0, 20000.0, 5000.0, 5000.0, 5.0, 5000.0, 70.0]
+        else:
+            state_scale = [10.0, 1000.0, 100.0, 0.1, 100.0, 10.0]
+            state_lower = [-20.0, 0.1, 0.1, 1.0e-4, 0.1, -20.0]
+            state_upper = [150.0, 20000.0, 5000.0, 5.0, 5000.0, 70.0]
+        self.register_buffer("state_scale", torch.tensor(state_scale, **factory))
+        self.register_buffer("state_lower", torch.tensor(state_lower, **factory))
+        self.register_buffer("state_upper", torch.tensor(state_upper, **factory))
+
+    def _prepare_weather(self, weather: Mapping[str, Any]) -> dict[str, Tensor]:
+        required = list(self.WEATHER_COLUMNS)
+        if not self.energy_balance:
+            required.append("controlTemp")
+        missing = [name for name in required if name not in weather]
+        if missing:
+            raise KeyError(f"Missing weather field(s): {', '.join(missing)}")
+
+        tensors: list[Tensor] = []
+        for name in required:
+            value = torch.as_tensor(
+                weather[name], dtype=self.state_scale.dtype, device=self.state_scale.device
+            )
+            if value.ndim == 0:
+                value = value.reshape(1)
+            if value.ndim != 1:
+                raise ValueError(f"Weather field {name!r} must be scalar or one-dimensional")
+            tensors.append(value)
+        tensors = list(torch.broadcast_tensors(*tensors))
+        prepared = dict(zip(required, tensors, strict=True))
+
+        detached = {name: value.detach() for name, value in prepared.items()}
+        if any(not bool(torch.isfinite(value).all()) for value in detached.values()):
+            raise ValueError("Weather fields must contain only finite values")
+        if bool((detached["pressure"] <= 0).any()):
+            raise ValueError("Weather field 'pressure' must be positive")
+        if bool((detached["wind"] <= 0).any()):
+            raise ValueError(
+                "Weather field 'wind' must be positive; zero wind can create "
+                "an undefined zero-transfer boundary state"
+            )
+        if bool((detached["ea"] < 0).any()):
+            raise ValueError("Weather field 'ea' must be non-negative")
+        return prepared
+
+    def _derived(
+        self,
+        state: Tensor,
+        weather: Mapping[str, Tensor],
+        parameters: Mapping[str, Tensor],
+    ) -> dict[str, Tensor]:
+        if self.finite_gm:
+            a_net, cbs, ci, cm, gs, cb, t_leaf = state.unbind(dim=-1)
+            site_co2 = cm
+        else:
+            a_net, cbs, ci, gs, cb, t_leaf = state.unbind(dim=-1)
+            site_co2 = ci
+
+        core = self._biochemistry_core(
+            a_net, cbs, site_co2, t_leaf, weather["PAR"], weather["O2"], parameters
+        )
+
+        temperature_kelvin = weather["tAir"] + 273.15
+        leaf_kelvin = t_leaf + 273.15
+        mb = 0.5 * (1.0 + parameters["s"]) ** 2 / (1.0 + parameters["s"] ** 2)
+        conversion_gb = weather["pressure"] / (8.309 * temperature_kelvin)
+
+        gb_forced = parameters["cForced"] * temperature_kelvin**0.56 * (
+            (temperature_kelvin + 120.0)
+            * (weather["wind"] / parameters["leafDim"] / weather["pressure"])
+        ) ** 0.5
+
+        gb_mps = gb_forced
+        gb = gb_mps * conversion_gb
+        eb = (gs * core["ei"] + gb * mb * weather["ea"]) / self._safe_denominator(
+            gs + gb * mb
+        )
+        gb_free = torch.zeros_like(gb_forced)
+        for _ in range(self.boundary_iterations):
+            virtual_difference = leaf_kelvin / self._safe_denominator(
+                1.0 - 0.378 * eb / weather["pressure"]
+            ) - temperature_kelvin / self._safe_denominator(
+                1.0 - 0.378 * weather["ea"] / weather["pressure"]
+            )
+            gb_free = parameters["cFree"] * leaf_kelvin**0.56 * (
+                ((leaf_kelvin + 120.0) / weather["pressure"]) ** 0.5
+                * (
+                    self._absolute(virtual_difference, 1.0e-3)
+                    / parameters["leafDim"]
+                )
+                ** 0.25
+            )
+            gb_mps = self._maximum(gb_free, gb_forced, 1.0e-6)
+            gb = gb_mps * conversion_gb
+            eb = (
+                gs * core["ei"] + gb * mb * weather["ea"]
+            ) / self._safe_denominator(gs + gb * mb)
+
+        total_conductance = gs * gb * mb / self._safe_denominator(gs + gb * mb)
+
         stomatal_unbounded = (
             parameters["go"]
             + parameters["g1"]
             * a_net
             * eb
-            / response["ei"]
-            / self._safe_denominator(cb - gamma)
+            / core["ei"]
+            / self._safe_denominator(cb - core["Gamma"])
         )
         stomatal_target = self._maximum(
             stomatal_unbounded, parameters["go"].expand_as(stomatal_unbounded), 1.0e-5
@@ -466,15 +575,14 @@ class DifferentiableLeaf(nn.Module):
             latent_heat_molar
             * total_conductance
             / weather["pressure"]
-            * (response["ei"] - weather["ea"])
+            * (core["ei"] - weather["ea"])
         )
         emission = 2.0 * 0.94 * 5.67e-8 * leaf_kelvin**4
         radiation = weather["PAR"] + weather["NIR"] + weather["long"]
         energy_residual = radiation - 0.506 * a_net - sensible - latent - emission
 
-        carboxylation_factor = 1.0 - response["gammaStarRatio"] * obs / cbs
-        return {
-            **response,
+        result = {
+            **core,
             "aNet": a_net,
             "cbs": cbs,
             "ci": ci,
@@ -487,27 +595,8 @@ class DifferentiableLeaf(nn.Module):
             "gbFree": gb_free,
             "gb": gb,
             "g": total_conductance,
-            "J": electron_transport,
-            "obs": obs,
-            "GammaStar": gamma_star,
-            "Gamma_C": gamma_c,
-            "Gamma": gamma,
-            "vcLight": vc_light,
-            "vcCO2": vc_co2,
-            "vc": vc,
-            "vpLight": vp_light,
-            "vpCO2": vp_co2,
-            "vpCO2Uncapped": vp_co2_uncapped,
-            "vp": vp,
-            "a1": a1,
-            "b1": b1,
-            "enzymeWeight": enzyme_weight,
             "stomatalUnbounded": stomatal_unbounded,
             "stomatalTarget": stomatal_target,
-            "acCO2": carboxylation_factor * vc_co2 - response["rd"],
-            "acLight": carboxylation_factor * vc_light - response["rd"],
-            "apCO2": carboxylation_factor * vp_co2 - response["rd"],
-            "apLight": carboxylation_factor * vp_light - response["rd"],
             "H": sensible,
             "LE": latent,
             "emission": emission,
@@ -515,6 +604,9 @@ class DifferentiableLeaf(nn.Module):
             "energyResidual": energy_residual,
             "latentHeatMolar": latent_heat_molar,
         }
+        if self.finite_gm:
+            result["cm"] = cm
+        return result
 
     def _raw_residual(
         self,
@@ -529,7 +621,8 @@ class DifferentiableLeaf(nn.Module):
         ) * (values["cbs"] * values["a1"] / (values["cbs"] + values["b1"])) + values[
             "rd"
         ]
-        r_cbs = values["cbs"] - values["ci"] - (
+        site_co2 = values["cm"] if self.finite_gm else values["ci"]
+        r_cbs = values["cbs"] - site_co2 - (
             values["vp"] - values["aNet"] - values["rm"]
         ) / parameters["gbs"]
         r_ci = values["ci"] - values["cb"] + 1.6 * values["aNet"] / values["gs"]
@@ -545,7 +638,13 @@ class DifferentiableLeaf(nn.Module):
             r_temperature = values["energyResidual"]
         else:
             r_temperature = values["tLeaf"] - weather["controlTemp"]
-        return torch.stack((r_a, r_cbs, r_ci, r_gs, r_cb, r_temperature), dim=-1)
+
+        residuals = [r_a, r_cbs, r_ci]
+        if self.finite_gm:
+            r_cm = values["cm"] - values["ci"] + values["aNet"] / values["gm"]
+            residuals.append(r_cm)
+        residuals += [r_gs, r_cb, r_temperature]
+        return torch.stack(residuals, dim=-1)
 
     def _scaled_residual(
         self,
@@ -555,11 +654,12 @@ class DifferentiableLeaf(nn.Module):
     ) -> Tensor:
         state = scaled_state * self.state_scale
         raw = self._raw_residual(state, weather, parameters)
-        residual_scale = torch.tensor(
-            [10.0, 1000.0, 100.0, 0.1, 100.0, 100.0],
-            dtype=state.dtype,
-            device=state.device,
+        scale = (
+            [10.0, 1000.0, 100.0, 100.0, 0.1, 100.0, 100.0]
+            if self.finite_gm
+            else [10.0, 1000.0, 100.0, 0.1, 100.0, 100.0]
         )
+        residual_scale = torch.tensor(scale, dtype=state.dtype, device=state.device)
         if not self.energy_balance:
             residual_scale = residual_scale.clone()
             residual_scale[-1] = 10.0
@@ -569,17 +669,19 @@ class DifferentiableLeaf(nn.Module):
         temperature = (
             weather["tAir"] if self.energy_balance else weather["controlTemp"]
         )
-        state = torch.stack(
-            (
-                0.1 * weather["ca"],
-                10.0 * weather["ca"],
-                0.7 * weather["ca"],
-                torch.full_like(weather["ca"], 0.1),
-                0.8 * weather["ca"],
-                temperature,
-            ),
-            dim=-1,
-        )
+        components = [
+            0.1 * weather["ca"],
+            10.0 * weather["ca"],
+            0.7 * weather["ca"],
+        ]
+        if self.finite_gm:
+            components.append(0.65 * weather["ca"])
+        components += [
+            torch.full_like(weather["ca"], 0.1),
+            0.8 * weather["ca"],
+            temperature,
+        ]
+        state = torch.stack(components, dim=-1)
         return state / self.state_scale
 
     def _state_bounds(self) -> tuple[Tensor, Tensor]:
@@ -631,6 +733,9 @@ class DifferentiableLeaf(nn.Module):
             "Gamma": values["Gamma"],
             "Gamma_C": values["Gamma_C"],
         }
+        if self.finite_gm:
+            state["cm"] = values["cm"]
+            state["gm"] = values["gm"]
         mass = {
             "rd": values["rd"],
             "rbs": values["rbs"],
@@ -642,7 +747,8 @@ class DifferentiableLeaf(nn.Module):
             "acLight": values["acLight"],
             "apCO2": values["apCO2"],
             "apLight": values["apLight"],
-            "L": parameters["gbs"] * (values["cbs"] - values["ci"]),
+            "L": parameters["gbs"]
+            * (values["cbs"] - (values["cm"] if self.finite_gm else values["ci"])),
             "vp": values["vp"],
             "vc": values["vc"],
             "vpLight": values["vpLight"],
@@ -696,8 +802,8 @@ class DifferentiableLeaf(nn.Module):
         """Evaluate all coupled equations at a supplied physical state.
 
         This is useful for checking externally generated states. State columns
-        are ordered as ``aNet, cbs, ci, gs, cb, tLeaf`` when a tensor is
-        supplied. The operation remains differentiable.
+        are ordered per ``self.STATE_NAMES`` when a tensor is supplied. The
+        operation remains differentiable.
         """
 
         prepared = self._prepare_weather(weather)
@@ -733,7 +839,9 @@ class DifferentiableLeaf(nn.Module):
             if state_tensor.ndim == 1:
                 state_tensor = state_tensor.unsqueeze(0)
             if state_tensor.ndim != 2 or state_tensor.shape[-1] != len(self.STATE_NAMES):
-                raise ValueError("State tensor must have shape [rows, 6]")
+                raise ValueError(
+                    f"State tensor must have shape [rows, {len(self.STATE_NAMES)}]"
+                )
         if state_tensor.shape[0] != prepared["ca"].shape[0]:
             raise ValueError("State and weather row counts must match")
 
@@ -774,6 +882,385 @@ class DifferentiableLeaf(nn.Module):
                 torch.clamp(0.08 * detached_weather["PAR"] - 2.0, min=-10.0, max=100.0),
                 0.03 * detached_weather["ca"],
                 torch.zeros_like(detached_weather["ca"]),
+            )
+            for assimilation in alternative_assimilation:
+                alternative_initial = initial.clone()
+                alternative_initial[:, 0] = assimilation / self.state_scale[0]
+                alternate = solve_root(
+                    detached_residual,
+                    alternative_initial,
+                    lower,
+                    upper,
+                    self.solver_options,
+                )
+                root = select_better_root(root, alternate)
+                if bool(root.converged.all()):
+                    break
+
+        live_parameters = self.physical_parameters()
+        gradient_source = any(
+            parameter.requires_grad for parameter in self.raw_parameters.values()
+        ) or any(value.requires_grad for value in prepared.values())
+        if torch.is_grad_enabled() and gradient_source:
+            invalid_gradient = ~root.converged | root.at_state_bound
+            if bool(invalid_gradient.any()):
+                rows = torch.nonzero(invalid_gradient, as_tuple=False).flatten().tolist()
+                raise RuntimeError(
+                    "Implicit gradients require a converged interior root; "
+                    f"invalid row indices: {rows}. Use torch.no_grad() to inspect "
+                    "the flagged numerical output."
+                )
+            live_residual = lambda x: self._scaled_residual(
+                x, prepared, live_parameters
+            )
+            scaled_state = implicit_root(live_residual, root, self.solver_options)
+        else:
+            scaled_state = root.x
+
+        return self._build_output(
+            scaled_state,
+            prepared,
+            live_parameters,
+            iterations=root.iterations,
+            jacobian_condition=root.jacobian_condition,
+            line_search_failures=root.line_search_failures,
+            at_state_bound=root.at_state_bound,
+        )
+
+
+class LeafBiochemistry(_C4Model):
+    """Ci-driven C4 biochemistry model for fitting measured A-Ci curve data.
+
+    Takes intercellular CO2 (``ci``), leaf temperature, PAR, and O2 as direct
+    per-row inputs rather than solving a stomatal-conductance, boundary-layer,
+    or energy-balance system for them. This matches how A-Ci curve parameter
+    estimation is actually done in practice: a gas-exchange instrument already
+    reports ``ci`` (back-calculated from the measured ``An``/``gs``), and
+    biochemical parameters are fit by comparing predicted vs. measured
+    assimilation at that given ``ci`` — not by re-deriving ``ci`` from a
+    stomatal-conductance model. Use :class:`Leaf` instead when only ambient
+    CO2 (``ca``) is known and stomatal conductance itself must be solved.
+
+    ``finite_gm`` has the same meaning as on :class:`Leaf`: ``False`` (the
+    default) assumes infinite mesophyll conductance (PEP carboxylation draws
+    directly from ``ci``); ``True`` solves an additional coupled state ``cm``.
+    """
+
+    CONDITION_COLUMNS = ("ci", "tLeaf", "PAR", "O2")
+
+    def __init__(
+        self,
+        parameters: Mapping[str, float] | None = None,
+        *,
+        trainable: Iterable[str] = ("vcmax25", "vpmax25", "jmax25", "rd25"),
+        mode: Mode = "hard",
+        finite_gm: bool = False,
+        solver_options: SolverOptions | None = None,
+        dtype: torch.dtype = torch.float64,
+        device: torch.device | str | None = None,
+    ) -> None:
+        super().__init__(
+            parameters,
+            trainable=trainable,
+            mode=mode,
+            solver_options=solver_options,
+            dtype=dtype,
+            device=device,
+        )
+        self.finite_gm = bool(finite_gm)
+        self.STATE_NAMES = ("aNet", "cbs", "cm") if self.finite_gm else ("aNet", "cbs")
+
+        factory = {"dtype": dtype, "device": device}
+        if self.finite_gm:
+            state_scale = [10.0, 1000.0, 100.0]
+            state_lower = [-20.0, 0.1, 0.1]
+            state_upper = [150.0, 20000.0, 5000.0]
+        else:
+            state_scale = [10.0, 1000.0]
+            state_lower = [-20.0, 0.1]
+            state_upper = [150.0, 20000.0]
+        self.register_buffer("state_scale", torch.tensor(state_scale, **factory))
+        self.register_buffer("state_lower", torch.tensor(state_lower, **factory))
+        self.register_buffer("state_upper", torch.tensor(state_upper, **factory))
+
+    def _prepare_conditions(self, conditions: Mapping[str, Any]) -> dict[str, Tensor]:
+        required = self.CONDITION_COLUMNS
+        missing = [name for name in required if name not in conditions]
+        if missing:
+            raise KeyError(f"Missing condition field(s): {', '.join(missing)}")
+
+        tensors: list[Tensor] = []
+        for name in required:
+            value = torch.as_tensor(
+                conditions[name], dtype=self.state_scale.dtype, device=self.state_scale.device
+            )
+            if value.ndim == 0:
+                value = value.reshape(1)
+            if value.ndim != 1:
+                raise ValueError(f"Condition field {name!r} must be scalar or one-dimensional")
+            tensors.append(value)
+        tensors = list(torch.broadcast_tensors(*tensors))
+        prepared = dict(zip(required, tensors, strict=True))
+
+        detached = {name: value.detach() for name, value in prepared.items()}
+        if any(not bool(torch.isfinite(value).all()) for value in detached.values()):
+            raise ValueError("Condition fields must contain only finite values")
+        if bool((detached["ci"] <= 0).any()):
+            raise ValueError("Condition field 'ci' must be positive")
+        if bool((detached["O2"] <= 0).any()):
+            raise ValueError("Condition field 'O2' must be positive")
+        if bool((detached["PAR"] < 0).any()):
+            raise ValueError("Condition field 'PAR' must be non-negative")
+        return prepared
+
+    def _derived(
+        self,
+        state: Tensor,
+        conditions: Mapping[str, Tensor],
+        parameters: Mapping[str, Tensor],
+    ) -> dict[str, Tensor]:
+        if self.finite_gm:
+            a_net, cbs, cm = state.unbind(dim=-1)
+            site_co2 = cm
+        else:
+            a_net, cbs = state.unbind(dim=-1)
+            site_co2 = conditions["ci"]
+
+        core = self._biochemistry_core(
+            a_net,
+            cbs,
+            site_co2,
+            conditions["tLeaf"],
+            conditions["PAR"],
+            conditions["O2"],
+            parameters,
+        )
+        result = {
+            **core,
+            "aNet": a_net,
+            "cbs": cbs,
+            "ci": conditions["ci"],
+            "tLeaf": conditions["tLeaf"],
+        }
+        if self.finite_gm:
+            result["cm"] = cm
+        return result
+
+    def _raw_residual(
+        self,
+        state: Tensor,
+        conditions: Mapping[str, Tensor],
+        parameters: Mapping[str, Tensor],
+        derived: Mapping[str, Tensor] | None = None,
+    ) -> Tensor:
+        values = self._derived(state, conditions, parameters) if derived is None else derived
+        r_a = values["aNet"] - (
+            1.0 - values["GammaStar"] / values["cbs"]
+        ) * (values["cbs"] * values["a1"] / (values["cbs"] + values["b1"])) + values[
+            "rd"
+        ]
+        site_co2 = values["cm"] if self.finite_gm else values["ci"]
+        r_cbs = values["cbs"] - site_co2 - (
+            values["vp"] - values["aNet"] - values["rm"]
+        ) / parameters["gbs"]
+
+        residuals = [r_a, r_cbs]
+        if self.finite_gm:
+            r_cm = values["cm"] - values["ci"] + values["aNet"] / values["gm"]
+            residuals.append(r_cm)
+        return torch.stack(residuals, dim=-1)
+
+    def _scaled_residual(
+        self,
+        scaled_state: Tensor,
+        conditions: Mapping[str, Tensor],
+        parameters: Mapping[str, Tensor],
+    ) -> Tensor:
+        state = scaled_state * self.state_scale
+        raw = self._raw_residual(state, conditions, parameters)
+        scale = [10.0, 1000.0, 100.0] if self.finite_gm else [10.0, 1000.0]
+        residual_scale = torch.tensor(scale, dtype=state.dtype, device=state.device)
+        return raw / residual_scale
+
+    def _initial_state(self, conditions: Mapping[str, Tensor]) -> Tensor:
+        ci = conditions["ci"]
+        components = [0.1 * ci, 10.0 * ci]
+        if self.finite_gm:
+            components.append(0.9 * ci)
+        state = torch.stack(components, dim=-1)
+        return state / self.state_scale
+
+    def _state_bounds(self) -> tuple[Tensor, Tensor]:
+        return self.state_lower / self.state_scale, self.state_upper / self.state_scale
+
+    def _build_output(
+        self,
+        scaled_state: Tensor,
+        conditions: Mapping[str, Tensor],
+        parameters: Mapping[str, Tensor],
+        *,
+        iterations: Tensor,
+        jacobian_condition: Tensor,
+        line_search_failures: Tensor,
+        at_state_bound: Tensor,
+    ) -> LeafOutput:
+        state_tensor = scaled_state * self.state_scale
+        values = self._derived(state_tensor, conditions, parameters)
+        scaled_residual = self._scaled_residual(scaled_state, conditions, parameters)
+        residual_norm = torch.linalg.vector_norm(
+            scaled_residual.detach(), ord=float("inf"), dim=-1
+        )
+        converged = residual_norm <= self.solver_options.residual_tolerance
+
+        state = {
+            "flag": (~converged).to(state_tensor.dtype),
+            "cbs": values["cbs"],
+            "obs": values["obs"],
+            "ci": values["ci"],
+            "tLeaf": values["tLeaf"],
+            "Ko": values["Ko"],
+            "Kc": values["Kc"],
+            "Kp": values["Kp"],
+            "gammaStar": values["gammaStarRatio"],
+            "GammaStar": values["GammaStar"],
+            "Gamma_C": values["Gamma_C"],
+        }
+        if self.finite_gm:
+            state["cm"] = values["cm"]
+            state["gm"] = values["gm"]
+        mass = {
+            "rd": values["rd"],
+            "rbs": values["rbs"],
+            "rm": values["rm"],
+            "J": values["J"],
+            "aNet": values["aNet"],
+            "aGross": values["aNet"] + values["rd"],
+            "acCO2": values["acCO2"],
+            "acLight": values["acLight"],
+            "apCO2": values["apCO2"],
+            "apLight": values["apLight"],
+            "L": parameters["gbs"]
+            * (values["cbs"] - (values["cm"] if self.finite_gm else values["ci"])),
+            "vp": values["vp"],
+            "vc": values["vc"],
+            "vpLight": values["vpLight"],
+            "vpCO2": values["vpCO2"],
+            "vcLight": values["vcLight"],
+            "vcCO2": values["vcCO2"],
+            "vpmax": values["vpmax"],
+            "vcmax": values["vcmax"],
+            "jmax": values["jmax"],
+        }
+        limitation = {
+            "enzymeWeight": values["enzymeWeight"],
+            "vcCO2Limited": (values["vcCO2"] < values["vcLight"]),
+            "vpCO2Limited": (values["vpCO2"] < values["vpLight"]),
+            "vpRegenerationCapped": (values["vpCO2Uncapped"] >= 100.0),
+        }
+        diagnostics = SolverDiagnostics(
+            converged=converged.detach(),
+            iterations=iterations.detach(),
+            residual_norm=residual_norm.detach(),
+            jacobian_condition=jacobian_condition.detach(),
+            line_search_failures=line_search_failures.detach(),
+            at_state_bound=at_state_bound.detach(),
+        )
+        return LeafOutput(
+            state=state,
+            mass=mass,
+            energy={},
+            diagnostics=diagnostics,
+            residual=scaled_residual,
+            limitation=limitation,
+        )
+
+    def equilibrium_residual(
+        self,
+        state: Tensor | Mapping[str, Any],
+        conditions: Mapping[str, Any],
+        *,
+        scaled: bool = True,
+    ) -> Tensor:
+        """Evaluate the coupled biochemistry equations at a supplied state.
+
+        State columns are ordered per ``self.STATE_NAMES`` when a tensor is
+        supplied. The operation remains differentiable.
+        """
+
+        prepared = self._prepare_conditions(conditions)
+        if isinstance(state, Mapping):
+            missing = [name for name in self.STATE_NAMES if name not in state]
+            if missing:
+                raise KeyError(f"Missing state field(s): {', '.join(missing)}")
+            components = [
+                torch.as_tensor(
+                    state[name],
+                    dtype=self.state_scale.dtype,
+                    device=self.state_scale.device,
+                )
+                for name in self.STATE_NAMES
+            ]
+            components = [value.reshape(1) if value.ndim == 0 else value for value in components]
+            invalid_dimensions = [
+                name
+                for name, value in zip(self.STATE_NAMES, components, strict=True)
+                if value.ndim != 1
+            ]
+            if invalid_dimensions:
+                raise ValueError(
+                    "State fields must be scalar or one-dimensional; invalid: "
+                    + ", ".join(invalid_dimensions)
+                )
+            components = list(torch.broadcast_tensors(*components))
+            state_tensor = torch.stack(components, dim=-1)
+        else:
+            state_tensor = torch.as_tensor(
+                state, dtype=self.state_scale.dtype, device=self.state_scale.device
+            )
+            if state_tensor.ndim == 1:
+                state_tensor = state_tensor.unsqueeze(0)
+            if state_tensor.ndim != 2 or state_tensor.shape[-1] != len(self.STATE_NAMES):
+                raise ValueError(
+                    f"State tensor must have shape [rows, {len(self.STATE_NAMES)}]"
+                )
+        if state_tensor.shape[0] != prepared["ci"].shape[0]:
+            raise ValueError("State and condition row counts must match")
+
+        parameters = self.physical_parameters()
+        if scaled:
+            return self._scaled_residual(state_tensor / self.state_scale, prepared, parameters)
+        return self._raw_residual(state_tensor, prepared, parameters)
+
+    def forward(self, conditions: Mapping[str, Any]) -> LeafOutput:
+        if torch.is_inference_mode_enabled():
+            with torch.inference_mode(False), torch.no_grad():
+                ordinary_conditions = {
+                    name: value.clone() if isinstance(value, Tensor) else value
+                    for name, value in conditions.items()
+                }
+                return self.forward(ordinary_conditions)
+
+        prepared = self._prepare_conditions(conditions)
+        detached_conditions = {name: value.detach() for name, value in prepared.items()}
+        detached_parameters = self.physical_parameters(detach=True)
+        initial = self._initial_state(detached_conditions)
+        lower, upper = self._state_bounds()
+
+        detached_residual = lambda x: self._scaled_residual(
+            x, detached_conditions, detached_parameters
+        )
+        root = solve_root(
+            detached_residual,
+            initial,
+            lower,
+            upper,
+            self.solver_options,
+        )
+        if not bool(root.converged.all()):
+            alternative_assimilation = (
+                torch.clamp(0.08 * detached_conditions["PAR"] - 2.0, min=-10.0, max=100.0),
+                0.03 * detached_conditions["ci"],
+                torch.zeros_like(detached_conditions["ci"]),
             )
             for assimilation in alternative_assimilation:
                 alternative_initial = initial.clone()

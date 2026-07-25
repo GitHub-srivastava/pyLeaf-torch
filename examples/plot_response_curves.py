@@ -40,7 +40,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from pyleaf_torch import DifferentiableLeaf, simulate_dataframe
+from pyleaf_torch import Leaf, simulate_dataframe
 
 
 PAR_TO_Q = 4.57  # micromol photons per joule, also used inside pyLeaf
@@ -70,21 +70,21 @@ def run_curve(
     mode: str,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Run the differentiable model and return its state and diagnostics."""
-    torch_model = DifferentiableLeaf(
+    model = Leaf(
         parameters=parameters,
         trainable=(),
         mode=mode,
         dtype=torch.float64,
     )
-    _, torch_frames = simulate_dataframe(torch_model, weather)
+    _, frames = simulate_dataframe(model, weather)
 
-    torch_result = pd.DataFrame(
+    result = pd.DataFrame(
         {
-            "aNet": torch_frames.mass["aNet"],
-            "ci": torch_frames.state["ci"],
+            "aNet": frames.mass["aNet"],
+            "ci": frames.state["ci"],
         }
     )
-    return torch_result, torch_frames.diagnostics
+    return result, frames.diagnostics
 
 
 def parse_parameters(path: Path | None) -> dict[str, Any]:
@@ -127,7 +127,7 @@ def main() -> None:
         "--input", type=Path, default=REPOSITORY / "examples" / "data" / "Input.xlsx"
     )
     parser.add_argument(
-        "--output-dir", type=Path, default=REPOSITORY / "curve_comparison_output"
+        "--output-dir", type=Path, default=REPOSITORY / "curve_output"
     )
     parser.add_argument(
         "--base-row",
@@ -169,14 +169,14 @@ def main() -> None:
     aci_weather = curve_input(base, ca_values, "ca")
     aq_weather = curve_input(base, par_values, "PAR", scale_nir=True)
 
-    torch_aci, diag_aci = run_curve(aci_weather, parameters, args.mode)
-    torch_aq, diag_aq = run_curve(aq_weather, parameters, args.mode)
+    aci_result, diag_aci = run_curve(aci_weather, parameters, args.mode)
+    aq_result, diag_aq = run_curve(aq_weather, parameters, args.mode)
 
     aci = pd.DataFrame(
         {
             "ca": ca_values,
-            "ci": torch_aci["ci"],
-            "aNet": torch_aci["aNet"],
+            "ci": aci_result["ci"],
+            "aNet": aci_result["aNet"],
             "converged": diag_aci["converged"],
             "residual_norm": diag_aci["residual_norm"],
         }
@@ -186,8 +186,8 @@ def main() -> None:
             "PAR": par_values,
             "Q": par_values * PAR_TO_Q,
             "NIR": aq_weather["NIR"],
-            "ci": torch_aq["ci"],
-            "aNet": torch_aq["aNet"],
+            "ci": aq_result["ci"],
+            "aNet": aq_result["aNet"],
             "converged": diag_aq["converged"],
             "residual_norm": diag_aq["residual_norm"],
         }

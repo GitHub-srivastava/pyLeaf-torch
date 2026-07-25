@@ -13,7 +13,7 @@ from .outputs import LeafOutput
 if TYPE_CHECKING:
     import pandas as pd
 
-    from .model import DifferentiableLeaf
+    from .model import Leaf
 
 
 @dataclass(frozen=True)
@@ -89,7 +89,11 @@ def output_to_dataframes(output: LeafOutput) -> OutputFrames:
             "line_search_failures": output.diagnostics.line_search_failures.cpu().numpy(),
             "at_state_bound": output.diagnostics.at_state_bound.cpu().numpy(),
     }
-    residual_names = ("aNet", "cbs", "ci", "gs", "cb", "tLeaf")
+    residual_names = (
+        ("aNet", "cbs", "ci", "cm", "gs", "cb", "tLeaf")
+        if output.residual.shape[-1] == 7
+        else ("aNet", "cbs", "ci", "gs", "cb", "tLeaf")
+    )
     diagnostics_values.update(
         {
             f"scaled_residual_{name}": output.residual[:, index].detach().cpu().numpy()
@@ -107,7 +111,7 @@ def output_to_dataframes(output: LeafOutput) -> OutputFrames:
 
 
 def simulate_dataframe(
-    model: "DifferentiableLeaf", frame: "pd.DataFrame"
+    model: "Leaf", frame: "pd.DataFrame"
 ) -> tuple[LeafOutput, OutputFrames]:
     """Run a DataFrame and return both graph-carrying tensors and detached tables."""
 

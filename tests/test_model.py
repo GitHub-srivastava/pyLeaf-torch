@@ -3,11 +3,11 @@ from __future__ import annotations
 import pytest
 import torch
 
-from pyleaf_torch import DifferentiableLeaf, SolverOptions
+from pyleaf_torch import Leaf, LeafBiochemistry, SolverOptions
 
 
 def test_fixed_temperature_equilibrium_and_identities(weather) -> None:
-    model = DifferentiableLeaf(
+    model = Leaf(
         trainable=(),
         mode="hard",
         energy_balance=False,
@@ -27,7 +27,7 @@ def test_fixed_temperature_equilibrium_and_identities(weather) -> None:
 
 
 def test_energy_balance_converges(weather) -> None:
-    model = DifferentiableLeaf(
+    model = Leaf(
         trainable=(),
         mode="hard",
         energy_balance=True,
@@ -43,7 +43,7 @@ def test_energy_balance_converges(weather) -> None:
 
 def test_smooth_mode_has_finite_nonzero_parameter_gradients(weather) -> None:
     names = ("vcmax25", "jmax25", "g1")
-    model = DifferentiableLeaf(
+    model = Leaf(
         trainable=names,
         mode="smooth",
         energy_balance=False,
@@ -60,10 +60,10 @@ def test_smooth_mode_has_finite_nonzero_parameter_gradients(weather) -> None:
 
 
 def test_vpr25_is_structurally_unused(weather) -> None:
-    low = DifferentiableLeaf(
+    low = Leaf(
         {"vpr25": 20.0}, trainable=(), mode="hard", energy_balance=False
     )
-    high = DifferentiableLeaf(
+    high = Leaf(
         {"vpr25": 200.0}, trainable=(), mode="hard", energy_balance=False
     )
     with torch.no_grad():
@@ -78,7 +78,7 @@ def test_vpr25_is_structurally_unused(weather) -> None:
 
 def test_implicit_gradient_matches_central_difference(weather) -> None:
     one_row = {name: value[1:2] for name, value in weather.items()}
-    model = DifferentiableLeaf(
+    model = Leaf(
         trainable=("vcmax25",),
         mode="smooth",
         energy_balance=False,
@@ -103,7 +103,7 @@ def test_implicit_gradient_matches_central_difference(weather) -> None:
 
 
 def test_grad_and_no_grad_forward_values_are_identical(weather) -> None:
-    model = DifferentiableLeaf(
+    model = Leaf(
         trainable=("vcmax25",), mode="smooth", energy_balance=False
     )
     graph_output = model(weather)
@@ -120,7 +120,7 @@ def test_grad_and_no_grad_forward_values_are_identical(weather) -> None:
 
 
 def test_inference_mode_is_supported(weather) -> None:
-    model = DifferentiableLeaf(trainable=("vcmax25",), energy_balance=False)
+    model = Leaf(trainable=("vcmax25",), energy_balance=False)
     with torch.no_grad():
         expected = model(weather)
     with torch.inference_mode():
@@ -130,7 +130,7 @@ def test_inference_mode_is_supported(weather) -> None:
 
 
 def test_invalid_root_is_reported_instead_of_differentiated(weather) -> None:
-    model = DifferentiableLeaf(
+    model = Leaf(
         trainable=("vcmax25",),
         energy_balance=False,
         solver_options=SolverOptions(max_iterations=1, residual_tolerance=1.0e-14),
@@ -146,7 +146,7 @@ def test_hard_mode_enforces_residual_stomatal_conductance(weather) -> None:
     dark = {name: value[:1].clone() for name, value in weather.items()}
     dark["PAR"].zero_()
     dark["NIR"].zero_()
-    model = DifferentiableLeaf(trainable=(), mode="hard", energy_balance=False)
+    model = Leaf(trainable=(), mode="hard", energy_balance=False)
     with torch.no_grad():
         output = model(dark)
     assert float(output.state["gs"]) >= model.parameter_report()["go"]
@@ -154,15 +154,176 @@ def test_hard_mode_enforces_residual_stomatal_conductance(weather) -> None:
 
 @pytest.mark.parametrize(
     ("name", "value"),
-    (("vcmax25", -1.0), ("theta", 2.0), ("rd25", 0.8)),
+    (("vcmax25", -1.0), ("theta", 2.0), ("rd25", 0.8), ("gm25", -1.0)),
 )
 def test_invalid_parameter_values_are_rejected(name, value) -> None:
     with pytest.raises(ValueError, match=name):
-        DifferentiableLeaf({name: value}, trainable=())
+        Leaf({name: value}, trainable=())
 
 
 def test_bounded_endpoint_is_fixed_only() -> None:
-    fixed = DifferentiableLeaf({"alpha": 0.0}, trainable=())
+    fixed = Leaf({"alpha": 0.0}, trainable=())
     assert fixed.parameter_report()["alpha"] == 0.0
     with pytest.raises(ValueError, match="Trainable alpha"):
-        DifferentiableLeaf({"alpha": 0.0}, trainable=("alpha",))
+        Leaf({"alpha": 0.0}, trainable=("alpha",))
+
+
+def test_infinite_gm_is_the_default_and_matches_pre_gm_equations(weather) -> None:
+    model = Leaf(trainable=(), mode="hard", energy_balance=False)
+    assert model.finite_gm is False
+    assert "cm" not in model.STATE_NAMES
+    with torch.no_grad():
+        output = model(weather)
+    assert bool(output.diagnostics.converged.all())
+    assert "cm" not in output.state
+
+
+def test_finite_gm_draws_cm_below_ci_when_assimilating(weather) -> None:
+    model = Leaf(
+        {"gm25": 1.0},
+        trainable=(),
+        mode="hard",
+        energy_balance=False,
+        finite_gm=True,
+        solver_options=SolverOptions(max_iterations=100, residual_tolerance=1.0e-8),
+    )
+    with torch.no_grad():
+        output = model(weather)
+    assert bool(output.diagnostics.converged.all())
+    assimilating = output.mass["aNet"] > 0.0
+    assert bool(assimilating.any())
+    assert bool((output.state["cm"][assimilating] < output.state["ci"][assimilating]).all())
+    drawdown = output.mass["aNet"] / output.state["gm"]
+    assert torch.allclose(
+        output.state["ci"] - output.state["cm"], drawdown, rtol=1.0e-6, atol=1.0e-6
+    )
+
+
+def test_large_gm_keeps_cm_close_to_ci(weather) -> None:
+    model = Leaf(
+        {"gm25": 1.0e4},
+        trainable=(),
+        mode="hard",
+        energy_balance=False,
+        finite_gm=True,
+        solver_options=SolverOptions(max_iterations=100, residual_tolerance=1.0e-8),
+    )
+    with torch.no_grad():
+        output = model(weather)
+    assert bool(output.diagnostics.converged.all())
+    assert torch.allclose(output.state["cm"], output.state["ci"], rtol=0.0, atol=1.0e-2)
+
+
+def test_smooth_mode_has_finite_nonzero_gm25_gradient(weather) -> None:
+    model = Leaf(
+        {"gm25": 1.0},
+        trainable=("gm25",),
+        mode="smooth",
+        energy_balance=False,
+        finite_gm=True,
+        solver_options=SolverOptions(max_iterations=80, residual_tolerance=1.0e-8),
+    )
+    output = model(weather)
+    loss = output.mass["aNet"].mean()
+    loss.backward()
+    gradient = model.raw_parameters["gm25"].grad
+    assert gradient is not None
+    assert bool(torch.isfinite(gradient))
+    assert float(gradient.abs()) > 1.0e-10
+
+
+def test_gm_temperature_response_is_peaked(weather) -> None:
+    model = Leaf({"gm25": 3.0}, trainable=(), mode="hard", energy_balance=False, finite_gm=True)
+    response_cold = model._temperature_response(weather["tAir"][:1], model.physical_parameters())
+    response_hot = model._temperature_response(weather["tAir"][2:3], model.physical_parameters())
+    assert float(response_cold["gm"]) != pytest.approx(float(response_hot["gm"]))
+    assert bool(torch.isfinite(response_cold["gm"]))
+    assert bool(torch.isfinite(response_hot["gm"]))
+
+
+def _ci_conditions(weather, ci) -> dict[str, torch.Tensor]:
+    return {"ci": ci, "tLeaf": weather["controlTemp"], "PAR": weather["PAR"], "O2": weather["O2"]}
+
+
+def test_leaf_biochemistry_converges_from_direct_ci(weather) -> None:
+    model = LeafBiochemistry(
+        trainable=(),
+        mode="hard",
+        solver_options=SolverOptions(max_iterations=100, residual_tolerance=1.0e-8),
+    )
+    conditions = _ci_conditions(weather, 0.7 * weather["ca"])
+    with torch.no_grad():
+        output = model(conditions)
+    assert bool(output.diagnostics.converged.all())
+    assert torch.all(torch.isfinite(output.mass["aNet"]))
+    assert "gs" not in output.state
+    assert output.energy == {}
+
+
+def test_leaf_biochemistry_matches_leaf_given_leafs_own_ci(weather) -> None:
+    parameters = {"vcmax25": 55.0, "vpmax25": 120.0, "jmax25": 300.0, "rd25": 0.04}
+    solver = SolverOptions(max_iterations=100, residual_tolerance=1.0e-9)
+    leaf = Leaf(parameters, trainable=(), mode="hard", energy_balance=False, solver_options=solver)
+    with torch.no_grad():
+        leaf_output = leaf(weather)
+    assert bool(leaf_output.diagnostics.converged.all())
+
+    biochemistry = LeafBiochemistry(parameters, trainable=(), mode="hard", solver_options=solver)
+    conditions = _ci_conditions(weather, leaf_output.state["ci"])
+    with torch.no_grad():
+        bio_output = biochemistry(conditions)
+    assert bool(bio_output.diagnostics.converged.all())
+    assert torch.allclose(bio_output.mass["aNet"], leaf_output.mass["aNet"], rtol=1.0e-6, atol=1.0e-6)
+    assert torch.allclose(bio_output.state["cbs"], leaf_output.state["cbs"], rtol=1.0e-6, atol=1.0e-6)
+
+
+def test_leaf_biochemistry_finite_gm_matches_leaf_given_leafs_own_ci(weather) -> None:
+    parameters = {"vcmax25": 55.0, "vpmax25": 120.0, "jmax25": 300.0, "rd25": 0.04, "gm25": 2.0}
+    solver = SolverOptions(max_iterations=100, residual_tolerance=1.0e-9)
+    leaf = Leaf(
+        parameters, trainable=(), mode="hard", energy_balance=False, finite_gm=True, solver_options=solver
+    )
+    with torch.no_grad():
+        leaf_output = leaf(weather)
+    assert bool(leaf_output.diagnostics.converged.all())
+
+    biochemistry = LeafBiochemistry(
+        parameters, trainable=(), mode="hard", finite_gm=True, solver_options=solver
+    )
+    conditions = _ci_conditions(weather, leaf_output.state["ci"])
+    with torch.no_grad():
+        bio_output = biochemistry(conditions)
+    assert bool(bio_output.diagnostics.converged.all())
+    assert torch.allclose(bio_output.mass["aNet"], leaf_output.mass["aNet"], rtol=1.0e-6, atol=1.0e-6)
+    assert torch.allclose(bio_output.state["cm"], leaf_output.state["cm"], rtol=1.0e-6, atol=1.0e-6)
+
+
+def test_leaf_biochemistry_rejects_missing_condition_field(weather) -> None:
+    model = LeafBiochemistry(trainable=())
+    conditions = _ci_conditions(weather, 0.7 * weather["ca"])
+    del conditions["PAR"]
+    with pytest.raises(KeyError, match="PAR"):
+        model(conditions)
+
+
+def test_leaf_biochemistry_rejects_nonpositive_ci(weather) -> None:
+    model = LeafBiochemistry(trainable=())
+    conditions = _ci_conditions(weather, torch.zeros_like(weather["ca"]))
+    with pytest.raises(ValueError, match="'ci' must be positive"):
+        model(conditions)
+
+
+def test_leaf_biochemistry_smooth_mode_has_finite_nonzero_vcmax25_gradient(weather) -> None:
+    model = LeafBiochemistry(
+        trainable=("vcmax25",),
+        mode="smooth",
+        solver_options=SolverOptions(max_iterations=100, residual_tolerance=1.0e-8),
+    )
+    conditions = _ci_conditions(weather, 0.7 * weather["ca"])
+    output = model(conditions)
+    loss = output.mass["aNet"].mean()
+    loss.backward()
+    gradient = model.raw_parameters["vcmax25"].grad
+    assert gradient is not None
+    assert bool(torch.isfinite(gradient))
+    assert float(gradient.abs()) > 1.0e-8

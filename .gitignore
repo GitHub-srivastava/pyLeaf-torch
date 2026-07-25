@@ -6,5 +6,6 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+curve_output*/
 curve_comparison_output*/
 benchmark_output/

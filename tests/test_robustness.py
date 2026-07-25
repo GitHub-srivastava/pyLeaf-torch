@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from pyleaf_torch import DifferentiableLeaf, SolverOptions
+from pyleaf_torch import Leaf, SolverOptions
 
 
 def test_difficult_forcing_rows_converge_with_staged_multistart() -> None:
@@ -32,7 +32,7 @@ def test_difficult_forcing_rows_converge_with_staged_multistart() -> None:
         [51, 75, 80, 86, 95, 99, 144, 152, 168, 176, 178, 193]
     )
     subset = {name: value[difficult] for name, value in weather.items()}
-    model = DifferentiableLeaf(
+    model = Leaf(
         trainable=(),
         mode="hard",
         energy_balance=False,
@@ -47,13 +47,13 @@ def test_difficult_forcing_rows_converge_with_staged_multistart() -> None:
 def test_zero_wind_has_clear_validation_error(weather) -> None:
     calm = {name: value.clone() for name, value in weather.items()}
     calm["wind"][0] = 0.0
-    model = DifferentiableLeaf(trainable=(), energy_balance=False)
+    model = Leaf(trainable=(), energy_balance=False)
     with pytest.raises(ValueError, match="zero wind"):
         model(calm)
 
 
 def test_residual_rejects_multidimensional_state_mapping(weather) -> None:
-    model = DifferentiableLeaf(trainable=(), energy_balance=False)
+    model = Leaf(trainable=(), energy_balance=False)
     malformed = {
         name: torch.ones((3, 1), dtype=torch.float64) for name in model.STATE_NAMES
     }
@@ -80,4 +80,4 @@ def test_invalid_solver_options_are_rejected(options) -> None:
 
 def test_unused_vpr25_cannot_be_marked_trainable() -> None:
     with pytest.raises(ValueError, match="do not use it"):
-        DifferentiableLeaf(trainable=("vpr25",))
+        Leaf(trainable=("vpr25",))

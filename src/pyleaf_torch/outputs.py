@@ -1,4 +1,4 @@
-"""Tensor outputs returned by :class:`DifferentiableLeaf`."""
+"""Tensor outputs returned by :class:`Leaf`."""
 
 from __future__ import annotations
 

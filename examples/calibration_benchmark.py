@@ -11,7 +11,7 @@ import numpy as np
 import torch
 from scipy.optimize import minimize
 
-from pyleaf_torch import DifferentiableLeaf, SolverOptions
+from pyleaf_torch import Leaf, SolverOptions
 
 
 FIT_NAMES = ("vcmax25", "jmax25", "g1")
@@ -52,13 +52,13 @@ def require_converged(output, label: str) -> None:
         raise RuntimeError(f"{label} has nonconverged row indices: {rows}")
 
 
-def raw_vector(model: DifferentiableLeaf) -> np.ndarray:
+def raw_vector(model: Leaf) -> np.ndarray:
     return np.array(
         [float(model.raw_parameters[name].detach()) for name in FIT_NAMES], dtype=float
     )
 
 
-def set_raw_vector(model: DifferentiableLeaf, vector: np.ndarray) -> None:
+def set_raw_vector(model: Leaf, vector: np.ndarray) -> None:
     with torch.no_grad():
         for name, value in zip(FIT_NAMES, vector, strict=True):
             model.raw_parameters[name].copy_(
@@ -80,7 +80,7 @@ def main() -> None:
     torch.manual_seed(7)
     weather = synthetic_weather(args.rows)
     solver = SolverOptions(max_iterations=100, residual_tolerance=1.0e-7)
-    truth_model = DifferentiableLeaf(
+    truth_model = Leaf(
         TRUTH,
         trainable=(),
         mode="smooth",
@@ -93,7 +93,7 @@ def main() -> None:
         target_a = truth_output.mass["aNet"].detach()
         target_gs = truth_output.state["gs"].detach()
 
-    gradient_model = DifferentiableLeaf(
+    gradient_model = Leaf(
         START,
         trainable=FIT_NAMES,
         mode="smooth",
@@ -137,7 +137,7 @@ def main() -> None:
         gradient_best_raw = raw_vector(gradient_model)
     gradient_seconds = time.perf_counter() - gradient_start
 
-    powell_model = DifferentiableLeaf(
+    powell_model = Leaf(
         START,
         trainable=FIT_NAMES,
         mode="smooth",
